@@ -231,18 +231,20 @@ def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
 
     workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
     safe_dir = workspace / "safe"
-    logd_path = workspace / "preflight.logd"
+    out_dir = workspace / "out"
+    logd_path = out_dir / "preflight.logd"
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
-        (safe_dir / "preflight.txt").write_text("encryptly preflight, if it fails, increase your timeout\n", encoding="utf-8")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
         result = subprocess.run(
             [
                 str(encryptly_bin),
                 "pack",
                 str(logd_path),
                 "--include",
-                str(workspace),
+                str(safe_dir),
                 "--max-file-size",
                 "32000",
             ],
@@ -251,10 +253,10 @@ def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
         )
-        # if result.returncode != 0:
-        #     output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
-        #     return False, output
         if not logd_path.exists():
+            if result.returncode != 0:
+                output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
+                return False, output
             return False, "encryptly preflight completed without creating a .logd"
         return True, "encryptly preflight passed"
     except subprocess.TimeoutExpired:
@@ -626,10 +628,13 @@ def generate_logd(
     home = Path.home()
     workspace = home / ".cache" / "tent-of-trials" / "logd-workspace"
     safe_dir = workspace / "safe"
+    out_dir = workspace / "out"
+    staged_logd_path = out_dir / logd_path.name
 
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         (safe_dir / "system-info.txt").write_text(
             collect_system_info(), encoding="utf-8"
@@ -666,21 +671,40 @@ def generate_logd(
                 log_lines.append(output)
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
-        sr = subprocess.run(
-            [
-                str(encryptly_bin),
-                "pack",
-                str(logd_path),
-                "--include",
-                str(workspace),
-                "--max-file-size",
-                "61440",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=1500,
-        )
+        try:
+            sr = subprocess.run(
+                [
+                    str(encryptly_bin),
+                    "pack",
+                    str(staged_logd_path),
+                    "--include",
+                    str(safe_dir),
+                    "--max-file-size",
+                    "61440",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            error = "encryptly pack timed out after 300 seconds"
+            print(
+                f"    {color('✗', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
+                f"{error}"
+            )
+            write_diagnostic_report(
+                metadata_path,
+                build_diagnostic_report(
+                    results,
+                    commit_id,
+                    logd_error=error,
+                    message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
+                ),
+            )
+            print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
+            commit_diagnostic_artifacts([metadata_path], commit_id)
+            return False
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
             print(
@@ -702,6 +726,23 @@ def generate_logd(
             commit_diagnostic_artifacts([metadata_path], commit_id)
             return False
 
+        if not staged_logd_path.exists():
+            error = f"encryptly pack reported success but did not create {staged_logd_path}"
+            print(f"    {color('✗', Colors.RED)} {error}")
+            write_diagnostic_report(
+                metadata_path,
+                build_diagnostic_report(
+                    results,
+                    commit_id,
+                    logd_error=error,
+                    message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
+                ),
+            )
+            print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
+            commit_diagnostic_artifacts([metadata_path], commit_id)
+            return False
+
+        shutil.copy2(staged_logd_path, logd_path)
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
         logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
